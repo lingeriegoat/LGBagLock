@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: LG Bag Lock
+## Notes: Lock items to their slots in the default bags; the sort button skips locked items.
+## Author: lingeriegoat
+## Version: 1.0.0
+## License: GPL-2.0-only
+## SavedVariablesPerCharacter: LGBagLockDB
+
+LGBagLock.lua
