@@ -386,106 +386,163 @@ local function findMerges(slots, cur)
 	return list
 end
 
-local function nextMoves(bags, slots, cur)
-	local moves, used = {}, {}
-	local function add(from, to, mayHold)
-		used[key(from.b, from.s)], used[key(to.b, to.s)] = true, true
-		moves[#moves + 1] = { from, to, mayHold = mayHold }
+local function withCount(it, n)
+	local copy = {}
+	for k, v in pairs(it) do copy[k] = v end
+	copy.count = n
+	return copy
+end
+
+local function makeOps(bags, slots, p, excluded, limit)
+	local desired = plan(bags, p)
+	local ops, used, work = {}, {}, false
+	local function free(k)
+		return not excluded[k] and not used[k] and not lockAt[k]
 	end
-	for _, pair in ipairs(findMerges(slots, cur)) do add(pair[1], pair[2]) end
-	if #moves > 0 then return moves end
-	local desired = plan(bags, cur)
 	for _, T in ipairs(slots) do
-		local want = desired[T.k]
-		if want and not cur[T.k] and not used[T.k] then
-			for _, S in ipairs(slots) do
-				local it = cur[S.k]
-				if it and not used[S.k] and not lockAt[S.k] and same(it, want) and not same(it, desired[S.k]) then
-					add(S, T)
-					break
+		local want, have = desired[T.k], p[T.k]
+		if want and not same(have, want) then
+			work = true
+			if #ops < limit and free(T.k) then
+				local best, any
+				for _, S in ipairs(slots) do
+					local it = p[S.k]
+					if S.k ~= T.k and it and free(S.k) and same(it, want) and not same(it, desired[S.k])
+						and (not have or fits(S.bag, have)) then
+						if have and same(desired[S.k], have) then best = S break end
+						any = any or S
+					end
+				end
+				local S = best or any
+				if S then
+					used[S.k], used[T.k] = true, true
+					ops[#ops + 1] = { S, T, swap = have ~= nil }
 				end
 			end
 		end
 	end
-	for _, T in ipairs(slots) do
-		local want, have = desired[T.k], cur[T.k]
-		if want and have and not used[T.k] and not same(want, have) then
-			for _, S in ipairs(slots) do
-				local it = cur[S.k]
-				if S.k ~= T.k and it and not used[S.k] and not lockAt[S.k] and same(it, want)
-					and not same(it, desired[S.k]) and fits(S.bag, have) then
-					add(S, T, true)
-					break
-				end
-			end
-		end
-	end
-	if #moves > 0 then return moves end
-	for _, T in ipairs(slots) do
-		local want, have = desired[T.k], cur[T.k]
-		if want and not same(want, have) then
-			if not have then return false end
-			for pass = 1, 2 do
-				for _, E in ipairs(slots) do
-					if not cur[E.k] and not lockAt[E.k] and fits(E.bag, have) and (pass == 2 or not desired[E.k]) then
-						return { { T, E } }
+	if #ops == 0 and work then
+		for _, T in ipairs(slots) do
+			local want, have = desired[T.k], p[T.k]
+			if want and have and not same(have, want) and free(T.k) then
+				for pass = 1, 2 do
+					for _, E in ipairs(slots) do
+						if not p[E.k] and free(E.k) and fits(E.bag, have) and (pass == 2 or not desired[E.k]) then
+							return { { T, E } }, true
+						end
 					end
 				end
 			end
-			return false
 		end
 	end
+	return ops, work
 end
 
 local sorter = CreateFrame("Frame")
 sorter:Hide()
-local rounds, stalls, lastSig, returnTo, pending, actionTime
+local inflight, swapMode, probe, returnTo, lastProgress, failures, elapsed = {}, nil, false, nil, 0, 0, 0
 
 local function finish(message)
 	sorter:Hide()
-	returnTo, pending = nil, false
+	inflight, returnTo, probe = {}, nil, false
 	if message then print("|cff4da6ffLG Bag Lock:|r " .. message) end
 end
 
-local function step()
+local function confirmed(e)
+	local info = getInfo(e.b, e.s)
+	if info and info.isLocked then return false end
+	if not e.item then return info == nil end
+	return info ~= nil and info.hyperlink == e.item.link and (info.stackCount or 1) == e.item.count
+end
+
+local function step(_, dt)
+	elapsed = elapsed + dt
+	if elapsed < 0.05 then return end
+	elapsed = 0
+	local now = GetTime()
 	if CursorHasItem() then
-		if not returnTo then return finish("sort stopped: unexpected item on cursor.") end
+		if not returnTo then
+			ClearCursor()
+			return finish("sort stopped: unexpected item on cursor.")
+		end
 		C.PickupContainerItem(returnTo.b, returnTo.s)
 		returnTo = nil
-		pending, actionTime = true, GetTime()
+		if probe then swapMode, probe = "hold", false end
+		lastProgress = now
 		return
 	end
-	if pending and GetTime() - actionTime < 1 then return end
-	pending, returnTo = false, nil
 	local bags, slots, cur = snapshot()
-	for _, it in pairs(cur) do
-		if it.busy then return end
-	end
-	local sig = {}
-	for _, sl in ipairs(slots) do
-		local it = cur[sl.k]
-		sig[#sig + 1] = it and (it.link .. it.count) or "-"
-	end
-	sig = table.concat(sig, "|")
-	stalls = sig == lastSig and stalls + 1 or 0
-	lastSig = sig
-	if stalls >= 3 then return finish("sort stalled.") end
-	local moves = nextMoves(bags, slots, cur)
-	if moves == nil then return finish() end
-	rounds = rounds + 1
-	if not moves or rounds > 300 then return finish("not enough free space to finish sorting.") end
-	for _, m in ipairs(moves) do
-		local from, to = m[1], m[2]
-		C.PickupContainerItem(from.b, from.s)
-		C.PickupContainerItem(to.b, to.s)
-		if CursorHasItem() then
-			C.PickupContainerItem(from.b, from.s)
-		elseif m.mayHold then
-			returnTo = from
-			break
+	for k, e in pairs(inflight) do
+		if confirmed(e) then
+			inflight[k] = nil
+			lastProgress = now
+		elseif now - e.t > 3 then
+			inflight[k] = nil
+			failures = failures + 1
 		end
 	end
-	pending, actionTime = true, GetTime()
+	if failures >= 8 then return finish("sort stopped: moves are being rejected.") end
+	local idle = next(inflight) == nil
+	if idle then
+		returnTo = nil
+		if probe then swapMode, probe = "direct", false end
+	end
+	local p, excluded, slotAt = {}, {}, {}
+	for k, it in pairs(cur) do
+		p[k] = it
+		if it.busy then excluded[k] = true end
+	end
+	for k, e in pairs(inflight) do
+		p[k] = e.item or nil
+		excluded[k] = true
+	end
+	for _, sl in ipairs(slots) do slotAt[sl.k] = sl end
+	local ops, work
+	local merge = idle and findMerges(slots, cur)[1]
+	if merge then
+		ops, work = { { slotAt[key(merge[1].b, merge[1].s)], slotAt[key(merge[2].b, merge[2].s)], merge = true } }, true
+	else
+		ops, work = makeOps(bags, slots, p, excluded, 12)
+	end
+	if not work and idle then return finish() end
+	if #ops == 0 then
+		if now - lastProgress > 5 then return finish("sort stopped: no progress.") end
+		return
+	end
+	if swapMode ~= "direct" then
+		local moves = {}
+		for _, op in ipairs(ops) do
+			if not op.swap and not op.merge then moves[#moves + 1] = op end
+		end
+		if #moves > 0 then
+			ops = moves
+		elseif idle then
+			ops = { ops[1] }
+		else
+			return
+		end
+	end
+	for _, op in ipairs(ops) do
+		local S, T = op[1], op[2]
+		local a, b = p[S.k], p[T.k]
+		C.PickupContainerItem(S.b, S.s)
+		C.PickupContainerItem(T.b, T.s)
+		if op.merge then
+			local total = a.count + b.count
+			local dst = math.min(total, b.max)
+			inflight[T.k] = { b = T.b, s = T.s, item = withCount(b, dst), t = now }
+			inflight[S.k] = { b = S.b, s = S.s, item = total > dst and withCount(a, total - dst) or false, t = now }
+			returnTo = S
+		else
+			inflight[S.k] = { b = S.b, s = S.s, item = b or false, t = now }
+			inflight[T.k] = { b = T.b, s = T.s, item = a, t = now }
+			if op.swap and swapMode ~= "direct" then
+				returnTo = S
+				probe = swapMode == nil
+			end
+		end
+	end
+	lastProgress = now
 end
 
 sorter:SetScript("OnUpdate", step)
@@ -494,7 +551,7 @@ local function startSort()
 	if sorter:IsShown() then return end
 	if CursorHasItem() then return print("|cff4da6ffLG Bag Lock:|r clear your cursor first.") end
 	if SOUNDKIT and SOUNDKIT.UI_BAG_SORTING_01 then PlaySound(SOUNDKIT.UI_BAG_SORTING_01) end
-	rounds, stalls, lastSig, returnTo, pending = 0, 0, nil, nil, false
+	inflight, returnTo, probe, lastProgress, failures, elapsed = {}, nil, false, GetTime(), 0, 0
 	sorter:Show()
 end
 
@@ -550,7 +607,6 @@ events:SetScript("OnEvent", function(_, event, name)
 	elseif event == "BAG_UPDATE_DELAYED" then
 		reconcile()
 		ready = true
-		pending = false
 		refresh()
 	elseif event == "PLAYER_REGEN_DISABLED" then
 		if lockMode then setMode(false) end
